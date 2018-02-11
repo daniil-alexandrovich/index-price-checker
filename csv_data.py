@@ -11,12 +11,15 @@ import smtplib
 import csv
 import os
 import time
+import threading
+
 
 from email.mime.multipart import MIMEMultipart
 from    email.mime.text   import MIMEText
 from      email.utils     import formatdate
 from   financial_getters  import AVData, QuandlData
 from       datetime       import datetime
+from         queue        import Queue
 
 '''
 TODO: Implement pymongo to write results to an internal database, maybe.
@@ -44,6 +47,8 @@ class CSVData:
         # Quandl.
         self.quandl_tickers = ('IGLT')
         self.prices = {}
+        self.data_lock = threading.Lock()
+        self.print_lock = threading.Lock()
     
     def load_csv(self, path, filename):
         '''Loads an input .csv file as a dictionary.'''
@@ -61,7 +66,7 @@ class CSVData:
         print("\nLoaded %s" % (filename))
         
         
-    def compare(self, RIC):
+    def compare(self, RIC, store_data = False):
         '''Compares price data for a particular RIC in the CSV to data obtained
         from a financial API.'''
         # RICs follow <ticker>.<suffix> formatting. Their lookup key in
@@ -89,22 +94,41 @@ class CSVData:
         # Finally, .csv data is compared to API data (if it exists) and returned.
         csv_price = float(self.data[RIC][column])
         if self.date not in api.data:
-            print('Warning: %s data not provided for %s' % (self.date.date(), ticker))
+            with self.print_lock:
+                print('Warning: %s data not provided for %s' % (self.date.date(), ticker))
             return ticker, csv_price, None
         else:
             api_price = float(api.price(date = self.date))
-        print('Received %s in %.2f sec' % (ticker, t-t0))
-        return ticker, csv_price, api_price
+        with self.print_lock:
+            print('Received %s in %.2f sec' % (ticker, t-t0))
+        if store_data:
+            with self.data_lock:
+                self.prices[RIC] = {'Ticker'    :ticker, 
+                                'CSV Price' :csv_price,
+                                'API Price' :api_price if api_price else 'NA',
+                                'Difference':csv_price-api_price if api_price else 'NA'}
+        return ticker, csv_price, api_price, csv_price-api_price
+    
+    def thread_handler(self):
+        while True:
+            RIC = self.q.get()
+            self.compare(RIC, store_data = True)
+            self.q.task_done()
     
     def check_contents(self):
         '''Constructs an internal dictionary (self.prices) mapping each index
         in the loaded .csv file to its internal and public price data.'''
+        t0 = time.time()
+        self.q = Queue()
         for RIC in self.data:
-            ticker, csv_price, api_price = self.compare(RIC)
-            self.prices[RIC] = {'Ticker'    :ticker, 
-                                'CSV Price' :csv_price,
-                                'API Price' :api_price if api_price else 'NA',
-                                'Difference':csv_price-api_price if api_price else 'NA'}
+            self.q.put(RIC)
+        for thread in range(10):
+            t = threading.Thread(target = self.thread_handler)
+            t.daemon = True
+            t.start()
+        self.q.join()
+#        for i in range(5)
+#            ticker, csv_price, api_price = self.compare(RIC, store_data = True)
     
     def generate_report(self, mail_to=None):
         '''Generates a .csv report from price data as compiled by self.check_contents. 
